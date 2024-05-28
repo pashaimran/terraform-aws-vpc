@@ -31,8 +31,8 @@ terraform {
 
 provider "aws" {
   region     = "ap-south-1"
-  access_key = "AKIAT3CB5XCR2YFK7FFK"
-  secret_key = "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"
+#  access_key = "AKIAT3CB5XCR2YFK7FFK"
+#  secret_key = "SNK95eqa9e814LEEqnolbvaWFkpgaFK8Gd/kWU+5"
 #   token      = data.vault_aws_access_credentials.creds.security_token
 # profile = "arn:aws:iam::<your account>:instance-profile/<your role name>"arn:aws:iam::264278751395:user/imran
 }
