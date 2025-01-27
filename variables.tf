@@ -52,6 +52,14 @@ variable "create_security_groups" {
   default = true
 }
 
+variable "aws_access_key" {
+  type = string
+}
+
+variable "aws_secret_key" {
+  type = string
+}
+
 # variable "db_name" {
 #   description = "Name of the database"
 #   type        = string
