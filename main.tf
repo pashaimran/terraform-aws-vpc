@@ -1,116 +1,216 @@
-## VPC and Internet Gateway are the two most important resources, and we will define them at the beginning of the file.
+# VPC
+# This block creates the main VPC with a CIDR block of "10.0.0.0/16". This provides a total of 65,536 IP addresses (2^16 - 2 reserved addresses) for the VPC. The VPC is named "EKS VPC" using the tags block.
+provider "aws" {
+  region = var.aws_region
+}
 
-resource "aws_vpc" "main" {
-  cidr_block = var.vpc_cidr_block
+terraform {
+  #required_version = ">= 1.9.5"
 
-  tags = {
-    Name = "${var.vpc_name}-VPC"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.63.1"
+    }
   }
 }
 
-resource "aws_internet_gateway" "gw" {
-  vpc_id = aws_vpc.main.id
+resource "aws_vpc" "my_vpc" {
+  cidr_block = var.vpc_cidr
 
   tags = {
-    Name = "${var.vpc_name} IG"
+    Name = var.vpc_name
   }
 }
 
+# data "aws_availability_zones" "available" {
+#   state = "available"
+# }
 
-## The number of subnets will be determined by the list of AZs passed from the variable.
-
-## Each AZ will have one private subnet and one public subnet, so we use count to iterate through each AZ.
-
+# Public subnets
 resource "aws_subnet" "public_subnets" {
-  count             = length(var.azs)
-  vpc_id            = aws_vpc.main.id
-  availability_zone = element(var.azs, count.index)
-  cidr_block        = element(var.public_subnet_cidrs, count.index)
+  count                   = length(var.public_subnet_cidrs)
+  vpc_id                  = aws_vpc.my_vpc.id
+  cidr_block              = var.public_subnet_cidrs[count.index]
+  #availability_zone       = data.aws_availability_zones.available.names[count.index] // used to automatically allocate az's
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = true
 
-  tags = {
-    Name = "Public Subnet ${count.index + 1}"
-  }
+  tags = merge(
+    {
+        Name = "public Subnet ${count.index + 1}"
+    },
+    var.additional_subnet_tags
+  )
 }
 
+
+# Private subnets
 resource "aws_subnet" "private_subnets" {
-  count             = length(var.azs)
-  vpc_id            = aws_vpc.main.id
-  availability_zone = element(var.azs, count.index)
-  cidr_block        = element(var.private_subnet_cidrs, count.index)
+  count                   = length(var.private_subnet_cidrs)
+  vpc_id                  = aws_vpc.my_vpc.id
+  cidr_block              = var.private_subnet_cidrs[count.index]
+  availability_zone       = var.azs[count.index]
+  map_public_ip_on_launch = false
+
+  tags = merge(
+    {
+        Name = "Private Subnet ${count.index + 1}"
+    },
+    var.additional_subnet_tags
+  )
+}
+
+# Internet gateway
+resource "aws_internet_gateway" "igw" {
+  count  = var.create_igw ? 1 : 0
+  vpc_id = aws_vpc.my_vpc.id
 
   tags = {
-    Name = "Private Subnet ${count.index + 1}"
+    Name = "Internet Gateway"
   }
 }
 
 
-## A NAT gateway serves as a gateway to the outside world, allowing EC2 instances and other resources within private subnets
-## to connect to the Internet.
+# NAT gateway
+resource "aws_nat_gateway" "nat_gateway" {
+  count         = var.create_nat_gateway ? 1 : 0
+  allocation_id = aws_eip.nat_eip[0].id
+# The allocation_id = aws_eip.nat_eip[0].id line links the NAT gateway to the Elastic IP you created earlier. 
+# This association ensures that the NAT gateway uses the specified EIP for outbound traffic.
+  subnet_id     = aws_subnet.public_subnets[0].id
 
-## One NAT gateway per Availability Zone (AZ) is created to minimize cloud costs.
-
-## Each NAT gateway needs an elastic IP address.
-
-## To generate elastic IP addresses and NAT gateways, we iterate over the total number of AZs using Terraform’s count function.
-
-resource "aws_eip" "nat_gateways" {
-  count = length(aws_subnet.private_subnets)
-  vpc   = true
+# The subnet_id = aws_subnet.public_subnets[0].id line places the NAT gateway in one of the public subnets. 
+# NAT gateways must be deployed in a public subnet to route traffic from private subnets to the internet.
+  
+  depends_on = [aws_internet_gateway.igw]  # Ensures the IGW is created first
+  tags = {
+    Name = "NAT Gateway"
+  }
 }
 
-resource "aws_nat_gateway" "nat_gw" {
-  count         = length(aws_subnet.private_subnets)
-  allocation_id = element(aws_eip.nat_gateways, count.index).id
-  subnet_id     = element(aws_subnet.private_subnets, count.index).id
+# Elastic IP for NAT gateway
+
+resource "aws_eip" "nat_eip" {
+  count = var.create_eip ? 1 : 0
+  domain = "vpc"
 }
 
-
-// A route table has a set of rules, called routes, that tell your subnet where to send network traffic.
-
-# We’re going to make two different kinds of route tables. One kind of route table is for public subnets, and the other kind is for private subnets.
-
-# Public subnet route table: All packets going to cidr block (“0.0.0.0/0”) would be sent to the Internet gateway.
-# Public subnet rout table: All traffic going to cidr block (“0.0.0.0/0”) would be sent to the NAT gateway in that AZ.
-# Public subnet’s route table and its route_table_association 
-
-resource "aws_route_table" "public_subnets" {
-  vpc_id = aws_vpc.main.id
+# Route tables and associations
+resource "aws_route_table" "public_route_table" {
+  vpc_id = aws_vpc.my_vpc.id
 
   route {
     cidr_block = "0.0.0.0/0"
-    gateway_id = aws_internet_gateway.gw.id
+    gateway_id = aws_internet_gateway.igw[0].id  # Reference with index [0]
   }
 
   tags = {
-    Name = "Public Subnet Route Table"
+    Name = "Public Route Table"
   }
 }
 
-resource "aws_route_table_association" "public_subnet_asso" {
+resource "aws_route_table" "private_route_table" {
+  vpc_id = aws_vpc.my_vpc.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat_gateway[0].id  # Reference with index [0]
+  }
+
+  tags = {
+    Name = "Private Route Table"
+  }
+}
+
+resource "aws_route_table_association" "public_subnet_routes" {
   count          = length(aws_subnet.public_subnets)
-  subnet_id      = element(aws_subnet.public_subnets[*].id, count.index)
-  route_table_id = aws_route_table.public_subnets.id
+  subnet_id      = aws_subnet.public_subnets[count.index].id
+  route_table_id = aws_route_table.public_route_table.id
 }
 
-## Private subnet’s route table and its route_table_association
-
-resource "aws_route_table" "private_subnets" {
-  count  = length(aws_nat_gateway.nat_gw)
-  vpc_id = aws_vpc.main.id
-
-  route {
-    cidr_block = "0.0.0.0/0"
-    gateway_id = element(aws_nat_gateway.nat_gw, count.index).id
-  }
-
-  tags = {
-    Name = "Private Subnet Route Table"
-  }
-}
-
-resource "aws_route_table_association" "private_subnet_asso" {
+resource "aws_route_table_association" "private_subnet_routes" {
   count          = length(aws_subnet.private_subnets)
-  subnet_id      = element(aws_subnet.private_subnets[*].id, count.index)
-  route_table_id = element(aws_route_table.private_subnets[*].id, count.index)
+  subnet_id      = aws_subnet.private_subnets[count.index].id
+  route_table_id = aws_route_table.private_route_table.id
 }
 
+# # Security groups
+# resource "aws_security_group" "k8s_api_server" {
+#   count = var.create_security_groups ? 1 : 0
+#   name   = "Kubernetes API Server"
+#   vpc_id = aws_vpc.my_vpc.id
+
+#   ingress {
+#     from_port   = 6443
+#     to_port     = 6443
+#     protocol    = "tcp"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+# }
+
+resource "aws_security_group" "k8s_worker_nodes" {
+  count = var.create_security_groups ? 1 : 0
+  name   = "Kubernetes Worker Nodes"
+  vpc_id = aws_vpc.my_vpc.id
+
+  ingress {
+    from_port       = 0
+    to_port         = 0
+    protocol        = "-1"
+    cidr_blocks = ["0.0.0.0/0"]  # Or specify a more restrictive CIDR block
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# resource "aws_security_group" "database_security_group" {
+#   name   = "Database Security Group"
+#   vpc_id = aws_vpc.my_vpc.id
+
+#   ingress {
+#     from_port       = 3306
+#     to_port         = 3306
+#     protocol        = "tcp"
+#     security_groups = [aws_security_group.k8s_worker_nodes.id]
+#   }
+
+#   egress {
+#     from_port   = 0
+#     to_port     = 0
+#     protocol    = "-1"
+#     cidr_blocks = ["0.0.0.0/0"]
+#   }
+# }
+
+
+# # Database
+# resource "aws_db_subnet_group" "database_subnets" {
+#   name       = "database-subnets"
+#   subnet_ids = aws_subnet.private_subnets[*].id
+# }
+
+# resource "aws_db_instance" "database" {
+#   engine                 = "mysql"
+#   engine_version         = "8.0.28"
+#   instance_class         = "db.t3.medium"
+#   allocated_storage      = 100
+#   storage_type           = "gp2"
+#   db_name                = var.db_name
+#   username               = var.db_username
+#   password               = var.db_password
+#   db_subnet_group_name   = aws_db_subnet_group.database_subnets.name
+#   vpc_security_group_ids = [aws_security_group.database_security_group.id]
+#}
